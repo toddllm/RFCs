@@ -280,45 +280,79 @@ general pattern is designed.
 
 ## **Metrics**
 
-Validation should produce four kinds of evidence:
+Validation should produce four distinct kinds of evidence. Each
+addresses a different question and uses a different probe shape; they
+are not interchangeable.
 
-| metric | what it measures |
+### Correctness evidence
+
+A TP layer correctness suite confirms the candidate stack does not
+regress synchronous behavior.
+
+| field | value |
 |---|---|
-| TP layer correctness | Forward output of each TP-aware layer (`RowParallelLinear`, `QKVParallelLinear`, `MergedColumnParallelLinear`, `VocabParallelEmbedding`, the bare `tensor_model_parallel_all_reduce`) matches a single-rank reference within fp16 tolerance. Gates correctness regressions on the synchronous path that all of stock vLLM exercises today. |
-| Async batch saved wall-clock | A fixed-pattern probe issues N `all_reduce(async_op=True)` calls upfront and waits at the end, compared to the same N calls issued synchronously back-to-back. Reports percent reduction in wall-clock. |
-| Compiled compute + communication overlap | A small probe runs an independent compiled compute kernel concurrently with an async allreduce, then reports both the saved wall-clock and the realized fraction of the theoretical overlap window (`max(compute, comm) / serial`). Catches regressions where the schedule fence accidentally drains unrelated compute. |
-| Model-path allreduce count | A representative TP=2 model forward (e.g. a 40-layer Granite-style architecture) reports the cumulative number of `all_reduce` calls per token. Confirms the comms substrate carries the full model path without errors and gives a denominator for any later per-token saving claim. |
+| What | Forward output of each TP-aware layer (`RowParallelLinear`, `QKVParallelLinear`, `MergedColumnParallelLinear`, `VocabParallelEmbedding`, the bare `tensor_model_parallel_all_reduce`) compared against a single-rank reference within fp16 tolerance. |
+| Why this gate | The synchronous path is the surface stock vLLM exercises today; this catches any regression introduced by the schedule-scoped fence or the two-broadcast `all_reduce`. |
+| Opening pass criterion | 5/5 PASS on both baseline and candidate. |
 
-A specific quantitative target is appropriate per layer; reasonable
-opening targets are:
+### Pipelining evidence
 
-* TP layer correctness: **5/5 PASS** on baseline and candidate.
-* Async batch saved: **>= 12%** vs blocking-serial on a 24-layer
-  pattern with `H=4096`, `iters_per_layer=8`. Both runs through the
-  same communicator on the same hardware.
-* Compiled compute+comm overlap: **>= 50% of theoretical** at the
-  smallest tensor sizes the compiler will lower.
-* Model-path allreduce count: matches `1 + 2L` for an `L`-layer
-  TP=2 forward with no comms-level failures.
+A collective-batch async probe confirms that multiple in-flight
+`all_reduce(async_op=True)` calls actually pipeline through the
+schedule-scoped fence.
+
+| field | value |
+|---|---|
+| What | Issue `N` `all_reduce(async_op=True)` calls upfront, do a fixed compute window, then wait at the end. Compare wall-clock against the same `N` calls issued synchronously back-to-back through the same communicator on the same hardware. |
+| Why this gate | Without schedule-scoped completion, async batches fall back to the synchronous wall-clock; the saving is the direct test that the fence is not a global drain. |
+| Opening pass criterion | At least **12%** wall-clock reduction on a 24-layer pattern with `H=4096`, `iters_per_layer=8`. |
+
+### Overlap evidence
+
+A compiled compute + async allreduce probe confirms that an async
+allreduce can run alongside a separately submitted compute kernel.
+
+| field | value |
+|---|---|
+| What | Run a `torch.compile`-d compute kernel concurrently with an async allreduce. Report both the saved wall-clock vs serial `compute -> allreduce`, and the realized fraction of the theoretical overlap window (`max(compute, allreduce) / serial`). |
+| Why this gate | Pipelining (above) only proves multiple collectives can overlap each other. This proves a collective can overlap an unrelated compiled compute kernel. Catches regressions where the schedule fence accidentally drains submitted compute. |
+| Opening pass criterion | At least **50% of theoretical overlap realized** at the smallest tensor sizes the compiler will lower. |
+
+### Model-path evidence
+
+A representative TP=2 model forward reports cumulative `all_reduce`
+call count and zero comms-layer failures.
+
+| field | value |
+|---|---|
+| What | Run a 40-layer TP=2 forward (Granite-style architecture is a fair shape) and count cumulative `all_reduce` calls per token, plus comms-layer error count. |
+| Why this gate | Confirms the comms substrate carries the full model path without errors. Provides the denominator for any later per-token saving claim. The text quality of generated tokens is **not** an indicator at this gate; it is governed by separate model-layer numerical behavior, especially fp16 paths in OOT layers. |
+| Opening pass criterion | Allreduce count equals `1 + 2L` for an `L`-layer TP=2 forward; comms-layer error count is zero. |
 
 ## **Drawbacks**
 
-* **Behavior split between sync and async paths.** The TP=2 `all_reduce`
-  candidate switches the synchronous path from `recv -> add ->
-  broadcast` to two symmetric broadcasts. The reduced value is
-  identical, but the on-wire op pattern changes for sync callers too.
-  Where exact op patterns are observable (e.g. profiling captures), a
-  reviewer should expect the new pattern.
-* **Per-WorkSchedule fence cost.** The completion fence adds a small
-  per-schedule overhead. The synchronous path observes this cost
-  every time. For workloads that never use `async_op=True` this is
-  pure overhead.
-* **TP=2 only at the inference layer.** Until a native allreduce is
-  implemented, TP > 2 must continue to raise. The RFC narrows the
-  ask to TP=2 deliberately; any larger pattern is a separate design.
-* **Fence is in the lower runtime.** The schedule-scoped contract
-  must be implemented in the runtime layer, which is a separate
-  repository and review surface.
+* **On-wire op pattern changes for sync callers too.** The TP=2
+  `all_reduce` candidate replaces the existing
+  `recv -> add -> broadcast` pattern with two symmetric broadcasts and
+  a deferred add. The reduced value is identical to within fp16
+  reduction-order tolerance. Reviewers comparing profiling captures or
+  message traces will see the new pattern in synchronous runs as well
+  as async ones.
+* **Per-schedule fence overhead is paid on every schedule.** The
+  completion fence is the mechanism that makes `wait()` schedule-scoped.
+  Sync callers that never set `async_op=True` still pay the fence
+  cost. The validation suite's correctness gate is the place to bound
+  that cost; if a measured overhead exceeds the gate's tolerance, the
+  fence implementation needs revisiting before landing.
+* **TP > 2 remains explicitly out of scope.** The two-broadcast
+  fallback is correct only for TP=2 (each rank broadcasts its own
+  partial). Larger world sizes need either a native allreduce or a
+  different pattern; that is a separate design.
+* **Fence ownership crosses repositories.** The schedule-scoped
+  contract is enforced in the lower runtime layer, which lives in a
+  separate repository and review surface. Coordinating the runtime
+  change with the c10d backend change and the inference change
+  requires three reviews to land in compatible shape.
 
 ## **Alternatives**
 
@@ -327,20 +361,23 @@ opening targets are:
    larger native-allreduce design. The TP=2 fallback is intended as
    the smallest incremental shape that lets the upper layers reach
    the async user contract today.
-2. **Per-stream wait at the c10d layer.** The c10d layer could
-   continue to drain the runtime stream on every `wait()`, returning
-   a real `Work` whose `wait()` simply forwards to a stream
-   synchronize. This satisfies the type contract but defeats the
-   purpose: any unrelated submitted compute on the same stream is
-   pulled across the synchronization boundary, the overlap window
-   collapses, and probes that look for overlap show none.
-3. **Split-broadcast with a cached `WorkScheduleInfo`.** An earlier
-   proof-of-concept attempted to reuse a cached `WorkScheduleInfo`
-   and apply it per-call to amortize setup. Caching was not proven
-   safe under the current runtime; the candidate path here uses a
-   plain `broadcast()` per call and relies on the schedule fence for
-   pipelining instead of a cached info. Caching can be revisited as
-   a follow-up if a safe reuse pattern is established.
+2. **Per-stream wait at the c10d layer.** The c10d backend could
+   return a `Work` whose `wait()` calls a global stream synchronize.
+   The PyTorch type contract is satisfied. The overlap evidence gate
+   in the Metrics section, however, requires that an async allreduce
+   can run alongside an unrelated submitted compute kernel; a global
+   synchronize pulls that compute across the same boundary, so the
+   overlap fraction collapses to zero. The schedule-scoped contract
+   is what allows the overlap evidence gate to pass.
+3. **Split-broadcast with a cached `WorkScheduleInfo`.** An
+   alternative shape would split `broadcast()` into a setup phase
+   that returns a reusable `WorkScheduleInfo` and an apply phase
+   that binds it to a specific tensor on each call. That avoids
+   recreating the schedule descriptor every call. Cached reuse is
+   not proven safe under the current runtime, so this RFC's
+   candidate uses a plain `broadcast()` per call and relies on the
+   schedule fence for pipelining. Cached `WorkScheduleInfo` is a
+   reasonable follow-up once a safe reuse pattern is established.
 
 ## **Prior Art**
 
