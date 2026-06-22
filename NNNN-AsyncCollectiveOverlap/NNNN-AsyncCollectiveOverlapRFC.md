@@ -12,20 +12,28 @@ backend rejects `async_op=True` for collectives, so callers cannot
 issue a collective and continue with independent compute. This RFC
 proposes:
 
-1. A schedule-scoped completion contract in the lower communication
-   runtime so a `WorkSchedule`'s `wait()` and `query()` reflect that
-   schedule's own work, not the entire shared device stream.
+1. A schedule-scoped completion contract in the lower collective
+   implementation so a `WorkSchedule`'s `wait()` and `query()` reflect
+   that schedule's own work, not the entire shared device stream.
 2. A real `Work` handle for `dist.broadcast(..., async_op=True)` in the
    Spyre `torch.distributed` backend.
 3. A TP=2 fallback in the Spyre Inference communicator that exposes
    `SpyreCommunicator.all_reduce(input_, async_op=True)` and pipelines
    multiple in-flight reductions through two symmetric broadcasts.
 
+This RFC is a follow-on to
+[RFC 0099: Multi-Spyre Device Support Pytorch](../0099-MultiDevice/0099-MultiDeviceRFC.md).
+RFC 0099 establishes the public PyTorch integration shape for Spyre:
+Spyre tensors use the standard `torch.distributed` APIs, and those APIs
+route to the `spyreccl` backend for Spyre devices. This RFC keeps that
+shape and adds the async completion semantics needed for overlap.
+
 The scope is the async collective substrate. The RFC defines the
-runtime, c10d, and Spyre Inference pieces required for a caller to
-start a collective, run independent work, and wait on that collective
-later. Model-level scheduling policy and vLLM graph rewrites can build
-on this substrate in later work.
+`spyreccl` backend behavior, the logical collective completion
+contract below that backend, and the Spyre Inference communicator
+behavior required for a caller to start a collective, run independent
+work, and wait on that collective later. Model-level scheduling policy
+and vLLM graph rewrites can build on this substrate in later work.
 
 The result is the standard PyTorch user shape:
 
@@ -46,6 +54,33 @@ async collectives, then use that shape to create a first TP=2
 overlap path for inference.
 
 ## **Motivation**
+
+RFC 0099 defines the public route for Spyre collectives:
+
+```text
+PyTorch user code
+  |
+  v
+torch.distributed API
+  |
+  v
+spyreccl backend registered for "spyre" tensors
+  |
+  v
+Spyre device-to-device communication implementation
+```
+
+That route is important because application code should not need a
+Spyre-specific communication API. A model or framework should be able
+to call standard PyTorch collectives on `spyre` tensors and let the
+registered backend handle device communication.
+
+RFC 0099 also calls out the compiled execution problem: eager
+`torch.distributed` collectives can introduce graph breaks, while
+PyTorch functional collectives may fall back into `torch.distributed`
+when a compiler backend does not lower them directly. Async collective
+support does not solve every compiler lowering question, but it gives
+both eager and fallback paths a correct non-blocking `Work` contract.
 
 Tensor parallelism splits one model layer across multiple devices.
 Each rank computes part of the result; some layers then need the ranks
@@ -178,7 +213,7 @@ For TP-parallel inference this matters at three levels:
    `dist.broadcast(tensor, src=..., async_op=True)` returning a
    `Work` whose `wait()` is scoped to that broadcast. Today's Spyre
    backend cannot honor that contract.
-3. **Communication runtime.** The schedule-scoped completion model is
+3. **Lower collective implementation.** The schedule-scoped completion model is
    what lets multiple in-flight schedules share a device stream
    without observing each other's progress.
 
@@ -186,13 +221,13 @@ For TP-parallel inference this matters at three levels:
 
 ### Responsibilities By Layer
 
-The design has three implementation layers. Each layer has a small
-responsibility and a clear contract with the layer above it:
+The design extends the RFC 0099 stack in three places. Each layer has
+a small responsibility and a clear contract with the layer above it:
 
 | layer | responsibility |
 |---|---|
-| Communication runtime | Provide `WorkSchedule::start()`, `wait()`, `query()`, and `reset()` with schedule-scoped completion. |
-| Torch-Spyre c10d backend | Return a real PyTorch `Work` object for `dist.broadcast(..., async_op=True)` and map `Work::wait()` / `isCompleted()` to the schedule. |
+| Lower collective schedule | Provide `WorkSchedule::start()`, `wait()`, `query()`, and `reset()` with schedule-scoped completion. |
+| Torch-Spyre `spyreccl` backend | Return a real PyTorch `Work` object for `dist.broadcast(..., async_op=True)` and map `Work::wait()` / `isCompleted()` to the schedule. |
 | Spyre Inference communicator | Expose `SpyreCommunicator.all_reduce(..., async_op=True)` for TP=2 by composing two broadcasts and deferring the add until `wait()`. |
 
 The design follows the normal PyTorch async shape. That keeps
@@ -217,13 +252,13 @@ The intended runtime call path:
                           |
                           v
 +-----------------------------------------------------------+
-| Torch-Spyre c10d backend                                  |
-|   SpyreCCLBackend::broadcast(...)  -> Work handle         |
+| Torch-Spyre spyreccl backend                              |
+|   SpyreCCLBackend::broadcast(...) -> PyTorch Work handle  |
 +-----------------------------------------------------------+
                           |
                           v
 +-----------------------------------------------------------+
-| Communication runtime                                     |
+| Lower collective schedule                                 |
 |   WorkSchedule::start() / wait() / query() / reset()      |
 |   Schedule-scoped completion fence                        |
 +-----------------------------------------------------------+
@@ -234,11 +269,11 @@ The intended runtime call path:
 +-----------------------------------------------------------+
 ```
 
-### Schedule-Scoped Completion (Communication Runtime)
+### Schedule-Scoped Completion (Lower Collective Schedule)
 
-The communication runtime exposes a `WorkSchedule` object that
-collects the operations for one logical collective. Operations are
-launched onto a shared per-stream device queue.
+The lower collective implementation exposes a `WorkSchedule` object
+that collects the operations for one logical collective. Operations
+are launched onto a shared per-stream device queue.
 
 For the async user shape to work, the schedule contract is:
 
@@ -261,11 +296,19 @@ The contract this RFC proposes is API-level. The exact fence
 mechanism is a runtime implementation detail; what matters at this
 layer is that `wait(A)` does not wait for `B` and vice versa.
 
-### `dist.broadcast(async_op=True)` (Torch-Spyre)
+### `dist.broadcast(async_op=True)` (`spyreccl`)
 
-The Spyre c10d backend exposes a `broadcast(...)` entry point that
-already creates a `WorkSchedule` for the underlying broadcast. The
-required behavior change is small:
+RFC 0099 registers `spyreccl` as the backend for Spyre tensors. From
+the user perspective, the call remains a normal PyTorch distributed
+call:
+
+```python
+dist.broadcast(spyre_tensor, src=0, async_op=True)
+```
+
+The backend implementation already has a broadcast entry point that
+creates a logical schedule for the underlying broadcast. The required
+behavior change is small:
 
 * `broadcast(async_op=False)`: keeps the historical synchronous
   shape: submit the schedule, block on `wait()`, return a completed
@@ -303,12 +346,45 @@ bool SpyreCCLWork::isCompleted() {
 }
 ```
 
-Synchronous callers see no behavior change. Async callers receive a
-`Work` whose `wait()` is scoped to the broadcast they issued.
+Synchronous callers see the same result. Async callers receive a
+`Work` whose `wait()` is scoped to the broadcast they issued. The
+public contract is the PyTorch `Work` contract; the schedule is the
+backend implementation detail that makes that contract correct for
+Spyre devices.
+
+### Functional Collectives And Compiled Execution
+
+RFC 0099 describes why functional collectives matter for compiled
+execution: eager `torch.distributed` calls can be graph breaks, while
+PyTorch functional collectives give compiler flows a visible collective
+operation and may fall back to `torch.distributed` when a backend does
+not lower the operation directly.
+
+This RFC does not require a direct compiler lowering for the first
+milestone. It strengthens the public fallback path:
+
+```text
+compiled graph sees functional collective
+  |
+  v
+fallback to torch.distributed
+  |
+  v
+spyreccl backend for spyre tensors
+  |
+  v
+PyTorch Work handle with schedule-scoped wait/query
+```
+
+That means an eager caller and a compiled fallback caller can rely on
+the same async completion semantics. Later direct lowerings should
+preserve the same logical contract: starting a collective returns or
+records a handle whose wait/query scope is that collective, not a
+global stream drain.
 
 ### TP=2 `all_reduce(async_op=True)` (Spyre Inference)
 
-While the lower communication runtime does not yet implement a native
+While the lower collective implementation does not yet implement a native
 allreduce on Spyre, the inference communicator can compose an
 allreduce from broadcasts. The current sync fallback uses
 `recv -> add -> broadcast`, which has a data dependency between
@@ -401,7 +477,7 @@ Those proof points are intentionally narrow. They show that the async
 collective substrate is plausible and that the TP=2 fallback can be
 validated independently. The remaining gates are:
 
-* a current-source communication-runtime build that includes the
+* a current-source lower-collective build that includes the
   schedule-scoped completion contract;
 * a compiled compute plus async collective probe that demonstrates
   compute/communication overlap on top of the collective-pipelining
@@ -479,11 +555,11 @@ call count and zero comms-layer failures.
   fallback is correct only for TP=2 (each rank broadcasts its own
   partial). Larger world sizes need either a native allreduce or a
   different pattern; that is a separate design.
-* **Fence ownership crosses repositories.** The schedule-scoped
-  contract is enforced in the lower runtime layer, which lives in a
-  separate repository and review surface. Coordinating the runtime
-  change with the c10d backend change and the inference change
-  requires three reviews to land in compatible shape.
+* **Fence ownership crosses implementation layers.** The
+  schedule-scoped contract is enforced below the public `spyreccl`
+  backend surface. Coordinating that lower-layer behavior with the
+  `spyreccl` `Work` handle and the Spyre Inference communicator
+  requires compatible changes across the stack.
 
 ## **Alternatives**
 
@@ -492,7 +568,7 @@ call count and zero comms-layer failures.
    larger native-allreduce design. The TP=2 fallback is intended as
    the smallest incremental shape that lets the upper layers reach
    the async user contract today.
-2. **Per-stream wait at the c10d layer.** The c10d backend could
+2. **Per-stream wait at the `spyreccl` layer.** The backend could
    return a `Work` whose `wait()` calls a global stream synchronize.
    The PyTorch type contract is satisfied. The overlap evidence gate
    in the Metrics section, however, requires that an async allreduce
@@ -517,6 +593,11 @@ call count and zero comms-layer failures.
   with stream-aware completion. The user contract proposed here
   matches that shape so application code does not need a Spyre-only
   branch.
+* RFC 0099 establishes the public Spyre distributed surface: standard
+  `torch.distributed` calls on `spyre` tensors route to the `spyreccl`
+  backend, and functional collectives can fall back through that same
+  route. This RFC extends that public surface with async completion
+  semantics rather than introducing a new user-facing communication API.
 * Most modern accelerator runtimes expose a per-event or per-stream
   completion query rather than only a global synchronize. The
   schedule-scoped contract proposed here aligns with that pattern.
@@ -545,12 +626,12 @@ Documentation impact:
 * Spyre Inference: the `SpyreCommunicator.all_reduce` docstring should
   document the new `async_op` parameter, the work-handle shape, and
   the TP>2 raise.
-* Torch-Spyre: the c10d backend docs should clarify that
+* Torch-Spyre: the `spyreccl` backend docs should clarify that
   `dist.broadcast(async_op=True)` is supported and that the returned
   `Work` is schedule-scoped.
-* Communication runtime: the `WorkSchedule` docs should pin the
-  per-schedule completion contract so future runtime changes do not
-  silently revert to a global synchronize.
+* Lower collective layer: the `WorkSchedule` docs should pin the
+  per-schedule completion contract so future implementation changes do
+  not silently revert to a global synchronize.
 
 Existing PyTorch users on other accelerators will not need to learn a
 new pattern; the goal is parity with the standard async user shape.
@@ -570,15 +651,15 @@ new pattern; the goal is parity with the standard async user shape.
   overlap window on a `LLM.generate()` path needs either a Spyre
   out-of-tree linear-layer override or an upstream vLLM change. That
   is a follow-up RFC, not part of this one.
-* **Runtime API pairing.** The communication runtime API has been
-  evolving; a stable runtime API version that includes the
-  schedule-scoped contract should be pinned for this RFC's landing.
+* **Lower-layer API pairing.** The lower collective API has been
+  evolving; a stable API version that includes the schedule-scoped
+  contract should be pinned for this RFC's landing.
 * **Final ownership of the schedule fence.** This RFC describes the
   contract at the API level. The exact owner of the fence
-  implementation (runtime layer vs. backend layer) is an
-  implementation choice; the runtime layer is preferred because it
-  composes naturally with all consumers, but a backend-layer fence
-  is also acceptable as long as it satisfies the contract.
+  implementation (lower collective layer vs. backend layer) is an
+  implementation choice; the lower collective layer is preferred
+  because it composes naturally with all consumers, but a backend-layer
+  fence is also acceptable as long as it satisfies the contract.
 
 ## Resolution
 
@@ -590,9 +671,9 @@ Pending.
 
 ### Next Steps
 
-* Land the schedule-scoped completion contract in the communication
-  runtime.
-* Land the c10d backend `Work`-handle behavior in Torch-Spyre.
+* Land the schedule-scoped completion contract in the lower collective
+  layer.
+* Land the `spyreccl` backend `Work`-handle behavior in Torch-Spyre.
 * Land the TP=2 `all_reduce(async_op=True)` fallback in Spyre
   Inference.
 * Wire the validation probes into a CI lane that runs them against
