@@ -464,6 +464,18 @@ general pattern is designed.
 
 ### Current Prototype Status
 
+Public prototype branches are available for the upper layers:
+
+| layer | branch |
+|---|---|
+| Torch-Spyre `spyreccl` async broadcast `Work` handle | [`toddllm/torch-spyre#tdeshane/async-broadcast-work-candidate-20260622`](https://github.com/toddllm/torch-spyre/tree/tdeshane/async-broadcast-work-candidate-20260622) |
+| Spyre Inference TP=2 async allreduce fallback | [`toddllm/spyre-inference#tdeshane/async-tp2-allreduce-candidate-20260622`](https://github.com/toddllm/spyre-inference/tree/tdeshane/async-tp2-allreduce-candidate-20260622) |
+
+These branches are prototypes for review and validation. They are not
+the proposed API boundary; the proposed boundary remains the standard
+PyTorch async collective shape and the `spyreccl` backend behavior
+described above.
+
 The current public candidate work has three useful proof points:
 
 * The TP layer correctness probes pass for the layer surfaces that use
