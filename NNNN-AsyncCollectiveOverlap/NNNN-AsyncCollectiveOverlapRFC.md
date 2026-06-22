@@ -21,6 +21,12 @@ proposes:
    `SpyreCommunicator.all_reduce(input_, async_op=True)` and pipelines
    multiple in-flight reductions through two symmetric broadcasts.
 
+The scope is the async collective substrate. The RFC defines the
+runtime, c10d, and Spyre Inference pieces required for a caller to
+start a collective, run independent work, and wait on that collective
+later. Model-level scheduling policy and vLLM graph rewrites can build
+on this substrate in later work.
+
 The result is the standard PyTorch user shape:
 
 ```python
@@ -35,11 +41,43 @@ do_independent_work()
 tensor = work.wait()
 ```
 
+In one sentence: make Spyre collectives behave like normal PyTorch
+async collectives, then use that shape to create a first TP=2
+overlap path for inference.
+
 ## **Motivation**
 
 Tensor parallelism splits one model layer across multiple devices.
 Each rank computes part of the result; some layers then need the ranks
 to combine partial results.
+
+The combination step is a collective. For inference it is on the
+critical path because every token runs through the same layer stack.
+If each layer waits for communication before starting the next useful
+piece of compute, the per-layer communication cost accumulates into
+per-token latency.
+
+The useful mental model is:
+
+```text
+one token
+  |
+  v
++---------------------+     +---------------------+
+| transformer layer 0 | --> | transformer layer 1 | --> ...
++---------------------+     +---------------------+
+      |                           |
+      v                           v
+  local matmul                local matmul
+      |                           |
+      v                           v
+  TP collective               TP collective
+```
+
+The local matmul work and the collective work use different parts of
+the stack. When the runtime can keep the collective in flight and the
+caller has independent compute available, the communication latency can
+be partially hidden.
 
 For TP=2 the contributing operation is a sum-allreduce:
 
@@ -69,6 +107,26 @@ time -->
                 [ compute N+1 (independent work) ]
 ```
 
+The first implementation milestone is collective pipelining. A caller
+issues several collectives without waiting for each one immediately,
+then waits later:
+
+```text
+time -->
+
+sync:
+[ allreduce 0 ][ allreduce 1 ][ allreduce 2 ][ allreduce 3 ]
+
+async batch:
+[ start 0 ][ start 1 ][ start 2 ][ start 3 ][ wait all ]
+```
+
+This milestone proves that the collective implementation can keep more
+than one operation in flight without each `wait()` behaving like a
+global barrier. A separate compiled-compute gate then proves that the
+same substrate can overlap communication with an unrelated compute
+kernel.
+
 This only works when `wait()` is scoped to the work that was started.
 If `wait()` drains the whole shared runtime stream, unrelated compute
 and unrelated collectives are pulled across the synchronization
@@ -89,6 +147,24 @@ query(A) reports fence A state
 query(B) reports fence B state
 ```
 
+By contrast, a global drain has the wrong shape:
+
+```text
+Shared stream:
+  A1 -> A2 -> fence A -> B1 -> B2 -> fence B
+
+global_wait(A):
+  waits for all currently visible stream work
+  can accidentally include B
+
+schedule_wait(A):
+  waits only for fence A
+```
+
+The distinction matters because PyTorch `Work` handles are logical
+objects. A caller expects `work_a.wait()` to wait for operation A, not
+for every other operation that happens to share the same device stream.
+
 For TP-parallel inference this matters at three levels:
 
 1. **Inference layer.** vLLM-style tensor-parallel layers issue an
@@ -107,6 +183,21 @@ For TP-parallel inference this matters at three levels:
    without observing each other's progress.
 
 ## **Proposed Implementation**
+
+### Responsibilities By Layer
+
+The design has three implementation layers. Each layer has a small
+responsibility and a clear contract with the layer above it:
+
+| layer | responsibility |
+|---|---|
+| Communication runtime | Provide `WorkSchedule::start()`, `wait()`, `query()`, and `reset()` with schedule-scoped completion. |
+| Torch-Spyre c10d backend | Return a real PyTorch `Work` object for `dist.broadcast(..., async_op=True)` and map `Work::wait()` / `isCompleted()` to the schedule. |
+| Spyre Inference communicator | Expose `SpyreCommunicator.all_reduce(..., async_op=True)` for TP=2 by composing two broadcasts and deferring the add until `wait()`. |
+
+The design follows the normal PyTorch async shape. That keeps
+application code simple and gives later vLLM integration work the same
+control surface it already expects from other distributed backends.
 
 ### Layered Call Path
 
@@ -158,6 +249,8 @@ For the async user shape to work, the schedule contract is:
 * Empty schedules are safe (`wait()` and `query()` return without
   side effects).
 * Repeated `wait()` is safe.
+* Destroying a `Work` handle without waiting does not invalidate
+  in-flight runtime callbacks.
 
 The implementation appends a per-schedule completion fence as the last
 operation submitted in `start()`. The fence lifetime is independent of
@@ -175,7 +268,7 @@ already creates a `WorkSchedule` for the underlying broadcast. The
 required behavior change is small:
 
 * `broadcast(async_op=False)`: keeps the historical synchronous
-  shape — submit the schedule, block on `wait()`, return a completed
+  shape: submit the schedule, block on `wait()`, return a completed
   `Work`.
 * `broadcast(async_op=True)`: submit the schedule and return the
   `Work` immediately, **without** the inline `wait()`.
@@ -236,6 +329,21 @@ After both complete:
 Result on both ranks: A + B
 ```
 
+The important ordering point is that both ranks issue the same two
+broadcasts in the same order. Only the tensor each rank contributes is
+different:
+
+```text
+operation order:
+
+  1. broadcast from rank 0
+  2. broadcast from rank 1
+  3. local add after both broadcasts complete
+
+rank 0 contributes A to op 1 and receives B from op 2
+rank 1 receives A from op 1 and contributes B to op 2
+```
+
 The two broadcasts are independent (no value-level data dependency
 between them), so multiple `all_reduce(async_op=True)` calls in flight
 pipeline through the schedule-scoped completion fence above.
@@ -278,6 +386,29 @@ This fallback covers TP=2. Larger world sizes are an explicit
 out-of-scope item until either a native allreduce lands or a more
 general pattern is designed.
 
+### Current Prototype Status
+
+The current public candidate work has three useful proof points:
+
+* The TP layer correctness probes pass for the layer surfaces that use
+  tensor-parallel communication.
+* A collective-batch probe shows wall-clock savings when multiple
+  `all_reduce(async_op=True)` calls are issued before waiting.
+* The candidate branches can express the intended user shape at the
+  Spyre Inference and Torch-Spyre layers.
+
+Those proof points are intentionally narrow. They show that the async
+collective substrate is plausible and that the TP=2 fallback can be
+validated independently. The remaining gates are:
+
+* a current-source communication-runtime build that includes the
+  schedule-scoped completion contract;
+* a compiled compute plus async collective probe that demonstrates
+  compute/communication overlap on top of the collective-pipelining
+  substrate;
+* a full model-path integration that shows where the async calls are
+  introduced in the inference layer.
+
 ## **Metrics**
 
 Validation should produce four distinct kinds of evidence. Each
@@ -315,7 +446,7 @@ allreduce can run alongside a separately submitted compute kernel.
 | field | value |
 |---|---|
 | What | Run a `torch.compile`-d compute kernel concurrently with an async allreduce. Report both the saved wall-clock vs serial `compute -> allreduce`, and the realized fraction of the theoretical overlap window (`max(compute, allreduce) / serial`). |
-| Why this gate | Pipelining (above) only proves multiple collectives can overlap each other. This proves a collective can overlap an unrelated compiled compute kernel. Catches regressions where the schedule fence accidentally drains submitted compute. |
+| Why this gate | Pipelining (above) proves multiple collectives can overlap each other. This gate proves a collective can overlap an unrelated compiled compute kernel. It catches regressions where the schedule fence accidentally drains submitted compute. |
 | Opening pass criterion | At least **50% of theoretical overlap realized** at the smallest tensor sizes the compiler will lower. |
 
 ### Model-path evidence
